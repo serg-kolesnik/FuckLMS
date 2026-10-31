@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FuckLMS — схема работы приложения</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 32px 20px 48px;
+      background: #f6f8fa;
+      color: #1f2328;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: #ffffff;
+      border: 1px solid #d0d7de;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 1px 3px rgba(31, 35, 40, 0.08);
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 28px;
+      margin-bottom: 12px;
+    }
+    p {
+      line-height: 1.6;
+      color: #495057;
+    }
+    .mermaid {
+      margin-top: 18px;
+      overflow-x: auto;
+      background: #fff;
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>FuckLMS — схема работы приложения</h1>
+    <p>
+      Приложение работает как браузерный клиент Moodle: оно логинится в LMS, сохраняет cookies,
+      считывает QR-параметры, получает <code>sesskey</code> и отправляет форму отметки присутствия.
+    </p>
+
+    <div class="mermaid">
+flowchart TD
+    A[Пользователь открывает приложение] --> B[AccountManager]
+    B --> C[EncryptedSharedPreferences]
+    C --> D{Есть сохраненные аккаунты?}
+    D -- Нет --> E[Добавить логин/пароль]
+    D -- Да --> F[Выбрать активный аккаунт]
+
+    F --> G[Сканирование QR-кода]
+    G --> H[parseQrUrl()]
+    H --> I{Есть sessid?}
+    I -- Нет --> Z[Ошибка: QR не распознан]
+    I -- Да --> J[QrData: sessionId, qrPassword]
+
+    J --> K[MoodleClient.login()]
+    K --> L[GET https://lms.uni-dubna.ru/login/index.php]
+    L --> M[Получить HTML]
+    M --> N{Есть logintoken?}
+    N -- Нет --> O[Ошибка: logintoken не найден]
+    N -- Да --> P[POST login/index.php]
+    P --> Q[username + password + rememberusername + logintoken]
+    Q --> R[Cookies сохраняются в CookieJar]
+    R --> S{Логин успешен?}
+    S -- Нет --> T[Ошибка логина/пароля]
+    S -- Да --> U[Пользователь запускает отметку присутствия]
+
+    U --> V[GET /mod/attendance/attendance.php?sessid=...]
+    V --> W[HTML страницы посещаемости]
+    W --> X{Есть sesskey?}
+    X -- Нет --> Y[Ошибка: sesskey не найден]
+    X -- Да --> AA[POST /mod/attendance/attendance.php?sessid=...&mark=1]
+    AA --> AB[Form fields:
+    sessid
+    sesskey
+    status=1
+    submitbutton=Save
+    studentpassword? 
+    qrpass?]
+    AB --> AC[Сервер Moodle]
+    AC --> AD{Ответ содержит saved / успешно / уже отмечен?}
+    AD -- saved / успешно --> AE[Отметка успешно поставлена]
+    AD -- already / уже отмечен --> AF[Пользователь уже отмечен]
+    AD -- иначе --> AG[Ответ 200, но подтверждение отсутствует]
+    </div>
+  </div>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', theme: 'default' });
+  </script>
+</body>
+</html>
