@@ -1,58 +1,89 @@
 # FuckLMS
 
-This Android application is a client for the Moodle LMS at `https://lms.uni-dubna.ru`. It does not expose its own backend API or use Retrofit. Instead, it performs browser-like HTTP requests to Moodle and parses HTML forms.
+Небольшое Android-приложение для работы с Moodle LMS через обычный веб-интерфейс.
 
-## Network flow
+## Что делает приложение
 
-### 1) Login
+Приложение не имеет собственного серверного API. Вместо этого оно:
 
-Request:
-- GET `https://lms.uni-dubna.ru/login/index.php`
-- Extract hidden field `logintoken` from HTML
-- POST to the same URL with:
-  - `username`
-  - `password`
-  - `rememberusername=0`
-  - `logintoken`
+- открывает страницы Moodle через HTTP
+- получает скрытые поля вроде `logintoken` и `sesskey`
+- отправляет форму логина и отметки посещаемости
+- хранит cookies как обычный браузер
+- сохраняет учетные данные локально в защищенном хранилище
 
-Headers:
-- `User-Agent`: browser-like string
-- `Referer`: `https://lms.uni-dubna.ru/login/index.php`
-- `Origin`: `https://lms.uni-dubna.ru`
-- `Content-Type: application/x-www-form-urlencoded`
+## Основные HTTP-запросы
 
-Cookie handling:
-- Moodle session cookies are stored in `CookieJar`
-- They are reused for all subsequent authenticated requests
+| Endpoint | Метод | Что отправляется | Назначение |
+|---|---|---|---|
+| `https://lms.uni-dubna.ru/login/index.php` | GET | — | Получить страницу логина и найти `logintoken` |
+| `https://lms.uni-dubna.ru/login/index.php` | POST | `username`, `password`, `rememberusername`, `logintoken` | Авторизация пользователя в Moodle |
+| `https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid={sessionId}` | GET | `sessid` | Загрузить страницу посещаемости и извлечь `sesskey` |
+| `https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid={sessionId}&mark=1` | POST | `sessid`, `sesskey`, `status=1`, `submitbutton=Save`, `studentpassword?`, `qrpass?` | Отметить пользователя как присутствовавшего |
 
-### 2) Attendance mark
+## Поля форм
 
-Request to open attendance page:
-- GET `https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid={sessionId}[&qrpass={qrPassword}]`
-- Extract `sesskey` from the returned HTML
+### 1. Авторизация
 
-Submit attendance:
-- POST `https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid={sessionId}&mark=1`
-- Form fields:
-  - `sessid`
-  - `sesskey`
-  - `status=1`
-  - `submitbutton=Save`
-  - optional `studentpassword`
-  - optional `qrpass`
+Тело запроса:
 
-### 3) QR parsing
+```text
+username=<логин>
+password=<пароль>
+rememberusername=0
+logintoken=<значение из HTML>
+```
 
-The app extracts data from a QR URL using query parameters:
+### 2. Отметка посещаемости
+
+Тело запроса:
+
+```text
+sessid=<sessionId>
+sesskey=<значение из HTML>
+status=1
+submitbutton=Save
+studentpassword=<пароль из QR, если есть>
+qrpass=<пароль из QR, если есть>
+```
+
+## Заголовки и сессия
+
+Приложение отправляет заголовки, похожие на браузер:
+
+```http
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+Referer: https://lms.uni-dubna.ru/...
+Origin: https://lms.uni-dubna.ru
+Content-Type: application/x-www-form-urlencoded
+```
+
+Cookie хранятся через `OkHttp CookieJar`, то есть приложение использует механизм, похожий на обычную веб-сессию браузера.
+
+## Структуры данных в приложении
+
+### `QrData`
+
+```kotlin
+data class QrData(val sessionId: String, val qrPassword: String?)
+```
+
+Используется для разбора QR-кода. Из него приложение берет:
+
 - `sessid`
-- `qrpass` or `password` or `studentpassword`
+- `qrpass`, либо `password`, либо `studentpassword`
 
-Data model:
-- `QrData(sessionId: String, qrPassword: String?)`
+### `UserAccount`
 
-## Local data model
+```kotlin
+data class UserAccount(
+    val login: String,
+    val password: String,
+    val isSelected: Boolean = true
+)
+```
 
-`AccountManager.kt` stores the user list in encrypted shared preferences:
+Список учетных записей сохраняется в `EncryptedSharedPreferences` в формате JSON:
 
 ```json
 [
@@ -64,17 +95,47 @@ Data model:
 ]
 ```
 
-Structure:
-- `UserAccount(login: String, password: String, isSelected: Boolean = true)`
+## Логика обработки ответов
 
-## Files involved
+### Авторизация
 
-- `app/src/main/java/com/fucklms/app/MoodleClient.kt` — HTTP client and form submission logic
-- `app/src/main/java/com/fucklms/app/AccountManager.kt` — encrypted local storage of accounts
-- `app/src/main/java/com/fucklms/app/QrParser.kt` — parsing QR and session data
-- `docs/openapi.yaml` — Swagger/OpenAPI outline of the network flow
-- `docs/network-api.md` — readable markdown documentation of the actual endpoints and fields
+Приложение считает вход успешным, если после POST не появляется:
 
-## Notes
+- `logintoken`
+- `loginerrormessage`
 
-This app is not a traditional REST API client. It acts as a Moodle web client that imitates browser behavior: HTML pages, form POSTs, and cookie-based session handling.
+### Отметка посещаемости
+
+После POST приложение анализирует HTML-ответ и ищет признаки успеха:
+
+- `saved`
+- `сохранено`
+- `успешно`
+
+Если встречаются признаки, что посетитель уже отмечен:
+
+- `already`
+- `уже отмечен`
+
+то приложение сообщает, что посещение уже зарегистрировано.
+
+## Где находится сетевой код
+
+- `app/src/main/java/com/fucklms/app/MoodleClient.kt`
+- `app/src/main/java/com/fucklms/app/QrParser.kt`
+- `app/src/main/java/com/fucklms/app/AccountManager.kt`
+
+## Важная оговорка
+
+Это не REST API приложения и не собственный backend. По факту это клиент Moodle, который работает как браузер:
+
+- открывает HTML-страницы,
+- читает hidden-поля,
+- отправляет формы,
+- хранит cookies,
+- анализирует HTML-ответы.
+
+Полная техническая документация по сетевому слою находится в:
+
+- `docs/network-api.md`
+- `docs/openapi.yaml`
