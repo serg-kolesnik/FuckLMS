@@ -1,0 +1,353 @@
+openapi: 3.0.3
+info:
+  title: FuckLMS Moodle Integration
+  description: |
+    This document describes the HTTP interaction with Moodle LMS used by the Android client in the
+    `slipynil/FuckLMS` repository. The app does not expose its own backend REST API; instead,
+    it authenticates against the Moodle LMS at `https://lms.uni-dubna.ru` and submits HTML form
+    data to mark attendance.
+
+    Two client mechanisms exist in the codebase, both targeting the endpoints below:
+
+    - **Primary (active in the UI):** an embedded `WebView` (`BrowserScreen` in `MainActivity.kt`)
+      that loads these pages and automates them via injected JavaScript — filling the login form,
+      selecting the "present" status radio, and clicking the save button.
+    - **Auxiliary (not wired to the UI):** `MoodleClient.kt`, a direct OkHttp client that parses
+      the HTML of these pages with regexes and submits the same forms programmatically.
+
+    Moodle is a form- and cookie-based web application, so this contract describes HTML pages and
+    `application/x-www-form-urlencoded` submissions rather than a JSON REST API.
+  version: 1.0.0
+  contact:
+    name: FuckLMS project
+    url: https://github.com/slipynil/FuckLMS
+servers:
+  - url: https://lms.uni-dubna.ru
+    description: Moodle LMS server used by the app
+security:
+  - cookieAuth: []
+paths:
+  /login/index.php:
+    get:
+      tags:
+        - Authentication
+      summary: Retrieve Moodle login page and logintoken
+      description: |
+        The app requests the login page first to extract the hidden `logintoken` field required
+        by Moodle. This request is done with a browser-like User-Agent and does not require
+        authentication.
+      parameters:
+        - in: header
+          name: User-Agent
+          required: true
+          schema:
+            type: string
+            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+      responses:
+        '200':
+          description: Login page HTML containing the `logintoken` input field
+          content:
+            text/html:
+              schema:
+                type: string
+              example: |
+                <html>...
+                <input type="hidden" name="logintoken" value="abc123xyz">
+                ...
+        '302':
+          description: Redirect if the login page redirects to a different Moodle route
+          headers:
+            Location:
+              schema:
+                type: string
+    post:
+      tags:
+        - Authentication
+      summary: Submit credentials and authenticate the user
+      description: |
+        After obtaining the `logintoken`, the app sends a standard Moodle form submission with
+        username and password. Cookies are preserved by the app to maintain the authenticated session.
+      parameters:
+        - in: header
+          name: User-Agent
+          required: true
+          schema:
+            type: string
+            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+        - in: header
+          name: Referer
+          required: true
+          schema:
+            type: string
+            example: https://lms.uni-dubna.ru/login/index.php
+        - in: header
+          name: Origin
+          required: true
+          schema:
+            type: string
+            example: https://lms.uni-dubna.ru
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginFormRequest'
+      responses:
+        '200':
+          description: Authentication result page. Success is inferred when the response does not contain login errors or logintoken fields.
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect after successful login
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: Moodle session cookie(s) used for subsequent authenticated requests
+            Location:
+              schema:
+                type: string
+        '403':
+          description: Access denied or invalid credentials
+  /mod/attendance/attendance.php:
+    get:
+      tags:
+        - Attendance
+      summary: Open the attendance page and obtain the sesskey
+      description: |
+        The client builds the attendance URL with `sessid` and optional `qrpass` from the QR code,
+        then requests the page. The direct HTTP client (`MoodleClient`) parses the `sesskey` value
+        from the HTML; the embedded WebView instead injects JavaScript that checks whether the
+        attendance has already been marked (`уже была отмечена` / `already been marked`) and,
+        if not, selects the "present" radio button, fills `studentpassword` from `qrpass`,
+        and submits the form from the page itself.
+      parameters:
+        - in: query
+          name: sessid
+          required: true
+          schema:
+            type: string
+            example: '123456'
+        - in: query
+          name: qrpass
+          required: false
+          schema:
+            type: string
+            nullable: true
+            example: 'abc123'
+        - in: header
+          name: User-Agent
+          required: true
+          schema:
+            type: string
+            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+      responses:
+        '200':
+          description: Attendance page HTML. The app searches the response for `sesskey`.
+          content:
+            text/html:
+              schema:
+                type: string
+              example: |
+                <html>...
+                <a href="attendance.php?sessid=123456&sesskey=ABCD1234">...</a>
+                ...
+        '302':
+          description: Redirect to login page if the session is expired or invalid
+    post:
+      tags:
+        - Attendance
+      summary: Submit an attendance mark
+      description: |
+        The app posts the attendance form with the parsed `sesskey` and marks the student as present.
+        If a QR password is present, it is also included as `studentpassword` and `qrpass`.
+      parameters:
+        - in: query
+          name: sessid
+          required: true
+          schema:
+            type: string
+            example: '123456'
+        - in: query
+          name: mark
+          required: true
+          schema:
+            type: string
+            enum: ['1']
+            example: '1'
+        - in: header
+          name: User-Agent
+          required: true
+          schema:
+            type: string
+            example: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+        - in: header
+          name: Referer
+          required: true
+          schema:
+            type: string
+            example: https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid=123456
+        - in: header
+          name: Origin
+          required: true
+          schema:
+            type: string
+            example: https://lms.uni-dubna.ru
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AttendanceMarkRequest'
+      responses:
+        '200':
+          description: Attendance response page. The direct HTTP client interprets success by looking for saved/success indicators in HTML.
+          content:
+            text/html:
+              schema:
+                type: string
+              example: |
+                <html>...Saved...</html>
+        '302':
+          description: Redirect after saving the mark
+  /mod/attendance/view.php:
+    get:
+      tags:
+        - Attendance
+      summary: Attendance module view page (success confirmation)
+      description: |
+        General attendance module page. The embedded WebView uses it as the success landmark:
+        after a successful save (or when the page text indicates the attendance has already been
+        marked), the injected JavaScript navigates to `view.php?id=122864&success=true`, which
+        makes `BrowserScreen` show the success status and proceed to the next selected account.
+      parameters:
+        - in: query
+          name: id
+          required: false
+          schema:
+            type: string
+            example: '122864'
+          description: Attendance module instance id (hardcoded in the current WebView flow)
+        - in: query
+          name: success
+          required: false
+          schema:
+            type: string
+            enum: ['true']
+            example: 'true'
+      responses:
+        '200':
+          description: Attendance module overview page HTML
+          content:
+            text/html:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: MoodleSession
+      description: Moodle session cookie maintained by the app after successful login.
+  schemas:
+    LoginFormRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - username
+        - password
+        - rememberusername
+        - logintoken
+      properties:
+        username:
+          type: string
+          description: Student or user login used in Moodle
+          example: ivanov@student
+        password:
+          type: string
+          format: password
+          description: Moodle account password
+          example: strongPassword123
+        rememberusername:
+          type: string
+          enum: ['0']
+          description: Moodle flag controlling whether username is remembered
+          example: '0'
+        logintoken:
+          type: string
+          description: Hidden token retrieved from the login page
+          example: abc123xyz
+    AttendanceMarkRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - sessid
+        - sesskey
+        - status
+        - submitbutton
+      properties:
+        sessid:
+          type: string
+          description: Unique attendance session identifier from the QR or LMS URL
+          example: '123456'
+        sesskey:
+          type: string
+          description: Moodle CSRF-like token extracted from the attendance page
+          example: ABCD1234
+        status:
+          type: string
+          enum: ['1']
+          description: |
+            Attendance status code. In the direct HTTP client it is always fixed to "present" (1).
+            In the WebView flow the "present" option is located by matching its label text
+            (present / присутств / был / явился and similar words), falling back to the first radio.
+          example: '1'
+        submitbutton:
+          type: string
+          enum: ['Save']
+          description: Moodle submit button label
+          example: Save
+        studentpassword:
+          type: string
+          nullable: true
+          description: Optional QR-provided password, if the attendance link includes it
+          example: qrPassword123
+        qrpass:
+          type: string
+          nullable: true
+          description: Optional QR password duplicate sent by the Moodle form
+          example: qrPassword123
+    QRData:
+      type: object
+      required:
+        - sessionId
+      properties:
+        sessionId:
+          type: string
+          description: Attendance session identifier taken from the QR URL
+          example: '123456'
+        qrPassword:
+          type: string
+          nullable: true
+          description: Optional password extracted from `qrpass`, `password`, or `studentpassword`
+          example: qrPassword123
+    UserAccount:
+      type: object
+      required:
+        - login
+        - password
+      properties:
+        login:
+          type: string
+          example: ivanov@student
+        password:
+          type: string
+          format: password
+          example: secret
+        isSelected:
+          type: boolean
+          description: Whether the account is currently selected as the active profile
+          default: true
+          example: true
