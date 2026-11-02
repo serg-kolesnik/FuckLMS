@@ -2,11 +2,21 @@ openapi: 3.0.3
 info:
   title: FuckLMS Moodle Integration
   description: |
-    This OpenAPI document describes the HTTP interaction used by the Android client in the
+    This document describes the HTTP interaction with Moodle LMS used by the Android client in the
     `slipynil/FuckLMS` repository. The app does not expose its own backend REST API; instead,
     it authenticates against the Moodle LMS at `https://lms.uni-dubna.ru` and submits HTML form
-    data to mark attendance. The endpoints below reflect the browser-style requests used by the
-    application.
+    data to mark attendance.
+
+    Two client mechanisms exist in the codebase, both targeting the endpoints below:
+
+    - **Primary (active in the UI):** an embedded `WebView` (`BrowserScreen` in `MainActivity.kt`)
+      that loads these pages and automates them via injected JavaScript — filling the login form,
+      selecting the "present" status radio, and clicking the save button.
+    - **Auxiliary (not wired to the UI):** `MoodleClient.kt`, a direct OkHttp client that parses
+      the HTML of these pages with regexes and submits the same forms programmatically.
+
+    Moodle is a form- and cookie-based web application, so this contract describes HTML pages and
+    `application/x-www-form-urlencoded` submissions rather than a JSON REST API.
   version: 1.0.0
   contact:
     name: FuckLMS project
@@ -107,8 +117,12 @@ paths:
         - Attendance
       summary: Open the attendance page and obtain the sesskey
       description: |
-        The app builds the attendance URL with `sessid` and optional `qrpass` from the QR code,
-        then requests the page so it can parse the `sesskey` value needed to submit the attendance form.
+        The client builds the attendance URL with `sessid` and optional `qrpass` from the QR code,
+        then requests the page. The direct HTTP client (`MoodleClient`) parses the `sesskey` value
+        from the HTML; the embedded WebView instead injects JavaScript that checks whether the
+        attendance has already been marked (`уже была отмечена` / `already been marked`) and,
+        if not, selects the "present" radio button, fills `studentpassword` from `qrpass`,
+        and submits the form from the page itself.
       parameters:
         - in: query
           name: sessid
@@ -189,7 +203,7 @@ paths:
               $ref: '#/components/schemas/AttendanceMarkRequest'
       responses:
         '200':
-          description: Attendance response page. The app interprets success by looking for saved/success indicators in HTML.
+          description: Attendance response page. The direct HTTP client interprets success by looking for saved/success indicators in HTML.
           content:
             text/html:
               schema:
@@ -198,6 +212,38 @@ paths:
                 <html>...Saved...</html>
         '302':
           description: Redirect after saving the mark
+  /mod/attendance/view.php:
+    get:
+      tags:
+        - Attendance
+      summary: Attendance module view page (success confirmation)
+      description: |
+        General attendance module page. The embedded WebView uses it as the success landmark:
+        after a successful save (or when the page text indicates the attendance has already been
+        marked), the injected JavaScript navigates to `view.php?id=122864&success=true`, which
+        makes `BrowserScreen` show the success status and proceed to the next selected account.
+      parameters:
+        - in: query
+          name: id
+          required: false
+          schema:
+            type: string
+            example: '122864'
+          description: Attendance module instance id (hardcoded in the current WebView flow)
+        - in: query
+          name: success
+          required: false
+          schema:
+            type: string
+            enum: ['true']
+            example: 'true'
+      responses:
+        '200':
+          description: Attendance module overview page HTML
+          content:
+            text/html:
+              schema:
+                type: string
 components:
   securitySchemes:
     cookieAuth:
@@ -253,7 +299,10 @@ components:
         status:
           type: string
           enum: ['1']
-          description: Attendance status. In this app it is always fixed to present (1)
+          description: |
+            Attendance status code. In the direct HTTP client it is always fixed to "present" (1).
+            In the WebView flow the "present" option is located by matching its label text
+            (present / присутств / был / явился and similar words), falling back to the first radio.
           example: '1'
         submitbutton:
           type: string

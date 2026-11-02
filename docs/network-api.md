@@ -1,206 +1,169 @@
-# HTTP API and data model used by FuckLMS
+# Сетевой слой и модель данных FuckLMS
 
-## Overview
+> Приложение **не имеет собственного backend-сервера**. Вся работа идёт напрямую с Moodle LMS
+> университета: `https://lms.uni-dubna.ru`. Документ описывает, как именно это происходит,
+> и соответствует текущему коду в `app/src/main/java/com/fucklms/app/`.
 
-The application in this repository does not have a custom backend API. It connects directly to the Moodle LMS at `https://lms.uni-dubna.ru` and interacts with the platform using standard HTML form submissions and browser-like cookies.
+## Обзор
 
-The code that performs the network work is located here:
+В репозитории есть два механизма работы с LMS:
 
-- `app/src/main/java/com/fucklms/app/MoodleClient.kt`
-- `app/src/main/java/com/fucklms/app/QrParser.kt`
-- `app/src/main/java/com/fucklms/app/AccountManager.kt`
+| Механизм | Где реализован | Статус | Суть |
+|---|---|---|---|
+| **WebView-автоматизация** | `MainActivity.kt` → `BrowserScreen()` | ✅ **активный**, используется в UI | Встроенный браузер с JS-инъекциями: сам заполняет форму входа и форму отметки |
+| **HTTP-клиент** | `MoodleClient.kt` | ⚠️ вспомогательный, к UI не подключён | Прямые OkHttp-запросы: скачивает HTML, парсит регексами, отправляет формы |
 
-## Endpoints actually used
+Оба механизма работают с одними и теми же страницами Moodle — контракт один и тот же.
 
-### 1. Login page
+---
 
-URL:
-- `GET https://lms.uni-dubna.ru/login/index.php`
+## 1. Основной поток — WebView-автоматизация
 
-Purpose:
-- Load the login page
-- Extract hidden field `logintoken`
+Источник: `MainActivity.kt`, функция `BrowserScreen()`.
 
-Example response snippet:
+### Подготовка
 
-```html
-<input type="hidden" name="logintoken" value="abc123xyz" />
-```
+- Входные данные: QR-ссылка (приходит со вкладки «Сканер») и список выбранных аккаунтов
+  (галочки на вкладке «Аккаунты»).
+- WebView настраивается: включены JavaScript и DOM Storage, мобильный User-Agent Chrome.
+- **Для каждого аккаунта по очереди:**
+  1. Все cookies WebView удаляются (`CookieManager.removeAllCookies()` + `flush()`) —
+     у каждого аккаунта гарантированно свежая сессия.
+  2. В WebView загружается QR-ссылка.
 
-Fields submitted in the next request:
+### Логика `onPageFinished` — что делает JS на каждой странице
 
-```text
-username
-password
-rememberusername=0
-logintoken
-```
+| Открытая страница | Действие приложения |
+|---|---|
+| URL содержит `login/index.php` | JS заполняет поля `#username` и `#password` значениями аккаунта и нажимает `#loginbtn` |
+| URL содержит `attendance.php` | Статус «Анализ страницы…» — JS проверяет и отправляет форму отметки (см. ниже) |
+| URL содержит `success=true` или `attendance/view.php` | Статус «Успех! Переход…» — пауза 1,5 с, переход к следующему аккаунту |
+| Прочая | Статус «Редирект…» — QR-ссылка загружается повторно |
 
-Request example:
+### JS на странице отметки (`attendance.php`)
 
-```http
-POST /login/index.php HTTP/1.1
-Host: lms.uni-dubna.ru
-User-Agent: Mozilla/5.0 (...)
-Referer: https://lms.uni-dubna.ru/login/index.php
-Origin: https://lms.uni-dubna.ru
-Content-Type: application/x-www-form-urlencoded
-Cookie: MoodleSession=...;
+1. **Проверка «уже отмечено».** Если текст страницы содержит `уже была отмечена` или
+   `already been marked`, выполняется переход на `view.php?id=122864&success=true`
+   (идентификатор зашит в коде как константа), что переводит приложение в ветку успеха.
+2. **Выбор статуса.** Среди радиокнопок `input[type="radio"][name="status"]` выбирается та,
+   подпись которой содержит одно из слов: `present`, `присутств`, `был`, `была`, `были`,
+   `явился`, `явилась`, `уважительн`. Если совпадений нет — выбирается первая радиокнопка.
+3. **Пароль из QR.** Если в QR-ссылке был параметр `qrpass`, его значение подставляется в поле
+   `input[name="studentpassword"]`.
+4. **Сохранение.** Нажимается кнопка отправки (`button[type="submit"]` или
+   `input[type="submit"]`) — форма уходит обычным POST, как из браузера.
 
-username=student
-password=secret
-rememberusername=0
-logintoken=abc123xyz
-```
+> Пароль QR извлекается функцией `parseQrPassword()` в `MainActivity.kt` — она читает
+> **только** параметр `qrpass`.
 
-### 2. Attendance page
+### Завершение
 
-URL:
-- `GET https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid={sessionId}[&qrpass={qrPassword}]`
+Когда выбранные аккаунты закончились, показывается
+«Все выбранные аккаунты отмечены!».
 
-Purpose:
-- Open the attendance page using a QR or session link
-- Extract `sesskey` from the page HTML
+---
 
-Response example:
+## 2. Вспомогательный HTTP-клиент — `MoodleClient.kt`
 
-```html
-<a href="attendance.php?sessid=123456&sesskey=ABCD1234">...</a>
-```
+Класс `MoodleClient(username, password)` построен на OkHttp. В текущей версии к интерфейсу
+**не подключён**, но полностью реализует тот же сценарий и может использоваться как
+программный аналог WebView-потока.
 
-The app extracts the value using regex:
+### `login(): String?` (null — успех, строка — текст ошибки)
 
-```text
-sesskey=([a-zA-Z0-9]+)
-```
+1. `GET /login/index.php` → из HTML регексом извлекается скрытое поле `logintoken`.
+2. `POST /login/index.php` с формой: `username`, `password`, `rememberusername=0`, `logintoken`.
+3. Логин считается успешным, если в ответе **нет** `name="logintoken"` и `loginerrormessage`.
 
-### 3. Submit attendance
+### `markAttendance(sessionId, qrPassword): String`
 
-URL:
-- `POST https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid={sessionId}&mark=1`
+1. `GET /mod/attendance/attendance.php?sessid=…[&qrpass=…]`:
+   - если HTML содержит `<title>Вход на сайт` → ошибка «сессия слетела»;
+   - регексом `sesskey=([a-zA-Z0-9]+)` извлекается `sesskey`.
+2. `POST /mod/attendance/attendance.php?sessid=…&mark=1` с формой:
+   `sessid`, `sesskey`, `status=1` (присутствовал), `submitbutton=Save`
+   и, при наличии пароля QR, — `studentpassword` + `qrpass`.
+3. Результат определяется по HTML ответа:
+   - `saved` / `сохранено` / `успешно` → «Успех!»;
+   - `already` / `уже отмечен` → «Уже отмечен»;
+   - иначе → «Ответ 200, но галочка не встала».
 
-Fields posted:
+Cookies хранятся в собственной реализации `CookieJar` (класс `CookieManager` в том же файле) —
+in-memory карта `host → список cookie`, без persistence.
 
-```text
-sessid
-sesskey
-status=1
-submitbutton=Save
-studentpassword (optional)
-qrpass (optional)
-```
+---
 
-Request example:
+## 3. HTTP-точки Moodle
 
-```http
-POST /mod/attendance/attendance.php?sessid=123456&mark=1 HTTP/1.1
-Host: lms.uni-dubna.ru
-User-Agent: Mozilla/5.0 (...)
-Referer: https://lms.uni-dubna.ru/mod/attendance/attendance.php?sessid=123456
-Origin: https://lms.uni-dubna.ru
-Content-Type: application/x-www-form-urlencoded
-Cookie: MoodleSession=...;
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/login/index.php` | Страница входа; содержит скрытое поле `logintoken` |
+| POST | `/login/index.php` | Отправка формы входа |
+| GET | `/mod/attendance/attendance.php?sessid={id}[&qrpass={pass}]` | Страница отметки посещаемости |
+| POST | `/mod/attendance/attendance.php?sessid={id}&mark=1` | Сохранение отметки |
+| GET | `/mod/attendance/view.php?id={id}&success=true` | Страница модуля посещаемости; WebView использует её как подтверждение успеха |
 
-sessid=123456
-sesskey=ABCD1234
-status=1
-submitbutton=Save
-studentpassword=qrPassword123
-qrpass=qrPassword123
-```
+Заголовки имитируют браузер:
 
-## Headers used by the app
+- `User-Agent` — WebView отправляет мобильный Chrome, `MoodleClient` — десктопный Chrome 120;
+- `Referer` и `Origin` — соответствующая страница и `https://lms.uni-dubna.ru`;
+- `Content-Type: application/x-www-form-urlencoded` для POST-форм.
 
-```http
-User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
-Referer: <current page>
-Origin: https://lms.uni-dubna.ru
-Content-Type: application/x-www-form-urlencoded
-```
+Модель аутентификации — **сессия на cookies** (`MoodleSession`), как в браузере.
+Токенов и собственного REST API приложение не использует.
 
-## Cookie model
+---
 
-The app uses `OkHttp` with a custom `CookieJar` implementation. Cookies are stored per host and reapplied on future requests.
+## 4. Разбор QR-кода
 
-This is equivalent to a browser session model, not a token-based API model.
-
-## Data structures used in requests
-
-### `QrData`
-
-Defined in `QrParser.kt`:
+`QrParser.kt`:
 
 ```kotlin
 data class QrData(val sessionId: String, val qrPassword: String?)
 ```
 
-This is built from QR query parameters:
+`parseQrUrl(qrUrl)` принимает из ссылки параметры:
 
-- `sessid`
-- `qrpass`
-- or `password`
-- or `studentpassword`
+- `sessid` — обязателен, иначе разбор считается неудачным;
+- `qrpass`, либо `password`, либо `studentpassword` — пароль QR (в таком порядке приоритета).
 
-### `UserAccount`
+> ⚠️ В UI `parseQrUrl()` сейчас **не вызывается**: сканер передаёт в `BrowserScreen` сырую
+> ссылку целиком, а пароль QR извлекается упрощённой функцией `parseQrPassword()` из
+> `MainActivity.kt` (читает только `qrpass`).
 
-Defined in `AccountManager.kt`:
+---
 
-```kotlin
-data class UserAccount(
-    val login: String,
-    val password: String,
-    val isSelected: Boolean = true
-)
-```
+## 5. Аккаунты и хранение
 
-The account list is stored encrypted in `EncryptedSharedPreferences` using a JSON array:
+`AccountManager.kt` сохраняет аккаунты в `EncryptedSharedPreferences`
+(файл `secure_accounts_prefs`, ключ `accounts_list`) в виде JSON-массива:
 
 ```json
 [
   {
-    "login": "user@example.com",
-    "password": "password",
+    "login": "ivanov",
+    "password": "secret",
     "isSelected": true
   }
 ]
 ```
 
-## Success criteria used by the app
+Шифрование:
 
-### Login
+- мастер-ключ — `MasterKey` со схемой `AES256_GCM`;
+- ключи — `AES256_SIV`, значения — `AES256_GCM`.
 
-The app checks whether the returned HTML contains:
+Операции:
 
-- `name="logintoken"`
-- `loginerrormessage`
+- `addAccount(login, password)` — добавляет; дубликаты по логину игнорируются;
+- `removeAccount(login)` — удаляет;
+- `toggleAccountSelection(login)` — переключает галочку «использовать аккаунт».
 
-If found, it interprets this as invalid login or failed authentication.
+---
 
-### Attendance
+## Связанные файлы
 
-The app checks the response HTML for markers like:
-
-- `saved`
-- `сохранено`
-- `успешно`
-- `already`
-- `уже отмечен`
-
-This determines whether attendance was successfully recorded or already marked.
-
-## Important note
-
-This repository does not implement a dedicated backend service API. The app behaves like a Moodle web automation client:
-
-- loads HTML pages
-- reads hidden fields
-- submits form data
-- stores session cookies
-- parses the returned HTML
-
-That is the real network contract used by the application.
-
-## Related files
-
-- `docs/openapi.yaml` — OpenAPI-like description of the Moodle interaction
-- `README.md` — compact project overview with the HTTP flow
+- [`openapi.yaml`](openapi.yaml) — OpenAPI-описание HTTP-контракта
+- [`app-flow.html`](app-flow.html) — диаграмма работы приложения
+- [`README.md`](README.md) — индекс документации
+- [`../README.md`](../README.md) — пользовательский обзор проекта

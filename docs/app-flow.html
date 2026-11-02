@@ -6,7 +6,7 @@
   <title>FuckLMS — схема работы приложения</title>
   <style>
     body {
-      font-family: Arial, sans-serif;
+      font-family: -apple-system, "Segoe UI", Arial, sans-serif;
       margin: 0;
       padding: 32px 20px 48px;
       background: #f6f8fa;
@@ -26,9 +26,22 @@
       font-size: 28px;
       margin-bottom: 12px;
     }
+    h2 {
+      font-size: 20px;
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid #d0d7de;
+    }
     p {
       line-height: 1.6;
       color: #495057;
+    }
+    code {
+      background: #f6f8fa;
+      border: 1px solid #d0d7de;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 0.9em;
     }
     .mermaid {
       margin-top: 18px;
@@ -36,60 +49,103 @@
       background: #fff;
       border-radius: 8px;
     }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid #d0d7de;
+      padding: 8px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f6f8fa;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>FuckLMS — схема работы приложения</h1>
     <p>
-      Приложение работает как браузерный клиент Moodle: оно логинится в LMS, сохраняет cookies,
-      считывает QR-параметры, получает <code>sesskey</code> и отправляет форму отметки присутствия.
+      Приложение состоит из трёх вкладок — <b>«Сканер»</b>, <b>«Браузер»</b> и <b>«Аккаунты»</b>.
+      После сканирования QR-кода встроенный браузер (<code>WebView</code>) автоматически входит в Moodle LMS
+      и отмечает присутствие по очереди для каждого выбранного аккаунта, используя JavaScript-инъекции.
     </p>
 
+    <h2>Компоненты</h2>
+    <table>
+      <tr>
+        <th>Компонент</th>
+        <th>Файл</th>
+        <th>Технология</th>
+        <th>Роль</th>
+      </tr>
+      <tr>
+        <td>Сканер QR</td>
+        <td><code>MainActivity.kt</code> → <code>ScannerScreen()</code></td>
+        <td>CameraX + ML Kit Barcode</td>
+        <td>Считывает QR-код и передаёт ссылку во «Браузер»</td>
+      </tr>
+      <tr>
+        <td>Встроенный браузер</td>
+        <td><code>MainActivity.kt</code> → <code>BrowserScreen()</code></td>
+        <td>WebView + JS-инъекции</td>
+        <td>Логин и отметка присутствия для каждого аккаунта</td>
+      </tr>
+      <tr>
+        <td>Аккаунты</td>
+        <td><code>AccountManager.kt</code></td>
+        <td>EncryptedSharedPreferences (AES-256)</td>
+        <td>Шифрованное хранение логинов/паролей, выбор галочками</td>
+      </tr>
+      <tr>
+        <td>HTTP-клиент (не подключён к UI)</td>
+        <td><code>MoodleClient.kt</code></td>
+        <td>OkHttp + разбор HTML</td>
+        <td>Программный аналог браузерного сценария</td>
+      </tr>
+    </table>
+
+    <h2>Основной поток</h2>
     <div class="mermaid">
 flowchart TD
-    A[Пользователь открывает приложение] --> B[AccountManager]
-    B --> C[EncryptedSharedPreferences]
-    C --> D{Есть сохраненные аккаунты?}
-    D -- Нет --> E[Добавить логин/пароль]
-    D -- Да --> F[Выбрать активный аккаунт]
+    Start([Пользователь открывает приложение]) --> Acc["«Аккаунты»: добавить логин/пароль,<br/>отметить нужные аккаунты галочками"]
+    Acc --> Scan["«Сканер»: навести камеру на QR-код"]
+    Scan --> Qr["QR-ссылка:<br/>mod/attendance/attendance.php?sessid=…&qrpass=…"]
+    Qr --> Browser["«Браузер» — BrowserScreen,<br/>список выбранных аккаунтов"]
 
-    F --> G[Сканирование QR-кода]
-    G --> H[parseQrUrl()]
-    H --> I{Есть sessid?}
-    I -- Нет --> Z[Ошибка: QR не распознан]
-    I -- Да --> J[QrData: sessionId, qrPassword]
+    Browser --> Loop[["Цикл: следующий выбранный аккаунт"]]
+    Loop --> Clear["Очистить cookies WebView<br/>(свежая сессия для аккаунта)"]
+    Clear --> Load[Загрузить QR-ссылку в WebView]
+    Load --> Page{"Какая страница открылась?"}
 
-    J --> K[MoodleClient.login()]
-    K --> L[GET https://lms.uni-dubna.ru/login/index.php]
-    L --> M[Получить HTML]
-    M --> N{Есть logintoken?}
-    N -- Нет --> O[Ошибка: logintoken не найден]
-    N -- Да --> P[POST login/index.php]
-    P --> Q[username + password + rememberusername + logintoken]
-    Q --> R[Cookies сохраняются в CookieJar]
-    R --> S{Логин успешен?}
-    S -- Нет --> T[Ошибка логина/пароля]
-    S -- Да --> U[Пользователь запускает отметку присутствия]
+    Page -- "login/index.php" --> LoginJs["JS: заполнить #username и #password,<br/>нажать #loginbtn"]
+    LoginJs --> Load
 
-    U --> V[GET /mod/attendance/attendance.php?sessid=...]
-    V --> W[HTML страницы посещаемости]
-    W --> X{Есть sesskey?}
-    X -- Нет --> Y[Ошибка: sesskey не найден]
-    X -- Да --> AA[POST /mod/attendance/attendance.php?sessid=...&mark=1]
-    AA --> AB[Form fields:
-    sessid
-    sesskey
-    status=1
-    submitbutton=Save
-    studentpassword? 
-    qrpass?]
-    AB --> AC[Сервер Moodle]
-    AC --> AD{Ответ содержит saved / успешно / уже отмечен?}
-    AD -- saved / успешно --> AE[Отметка успешно поставлена]
-    AD -- already / уже отмечен --> AF[Пользователь уже отмечен]
-    AD -- иначе --> AG[Ответ 200, но подтверждение отсутствует]
+    Page -- "attendance.php" --> Already{"Текст содержит «уже была отмечена» /<br/>«already been marked»?"}
+    Already -- Да --> SuccessUrl
+    Already -- Нет --> MarkJs["JS: выбрать radio со статусом<br/>«присутствовал» (или первый),<br/>подставить qrpass в studentpassword,<br/>нажать кнопку Save"]
+    MarkJs --> Post[POST формы отметки]
+    Post --> SuccessUrl["Страница view.php?…&success=true"]
+
+    Page -- "success=true / view.php" --> Done["Статус: «Успех! Переход…»,<br/>пауза 1,5 с"]
+    Page -- прочая --> Retry["Статус: «Редирект…»<br/>повторная загрузка QR-ссылки"]
+    Retry --> Load
+
+    SuccessUrl --> Done
+    Done --> More{"Остались аккаунты?"}
+    More -- Да --> Loop
+    More -- Нет --> Finish(["Все выбранные аккаунты отмечены!"])
     </div>
+
+    <p style="margin-top: 16px;">
+      Пароль из QR-кода извлекается функцией <code>parseQrPassword()</code> — она читает только
+      параметр <code>qrpass</code>. Полный разбор QR (<code>sessid</code> + альтернативные имена пароля)
+      реализован в <code>QrParser.kt</code>, но сейчас в UI не используется.
+    </p>
   </div>
 
   <script type="module">
